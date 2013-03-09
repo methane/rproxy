@@ -81,54 +81,29 @@ func copyHeader(dst, src http.Header) {
 	}
 }
 
-func copyConn(name string, r, w net.Conn) {
-	buf := make([]byte, 128000)
-	defer r.Close()
-	defer w.Close()
-	for {
-		n, rerr := r.Read(buf)
-		if rerr != nil {
-			log.Println(name, ": Fail to read: ", rerr.Error())
-			break
-		}
-		remain := buf
-		for n > 0 {
-			nw, werr := w.Write(remain)
-			if werr != nil {
-				log.Println(name, "Fail to write: ", werr.Error())
-				break
-			}
-			n -= nw
-			remain = remain[nw:]
-		}
-	}
-}
-
 func tcpProxy(rw http.ResponseWriter, outreq *http.Request) {
-	var host string = outreq.URL.Host
+	clientConn, _, err := rw.(http.Hijacker).Hijack()
+	if err != nil {
+		panic("Fail to hijack.")
+	}
+	defer clientConn.Close()
+
+	host := outreq.URL.Host
 	if !strings.ContainsRune(host, ':') {
 		host = host + ":80"
 	}
-	conn, err := net.Dial("tcp", host)
+	serverConn, err := net.Dial("tcp", host)
 	if err != nil {
 		panic("Can't connect to " + host)
 	}
-
-	hj, ok := rw.(http.Hijacker)
-	if !ok {
-		panic("Can't hijack.")
-	}
-	rconn, _, err2 := hj.Hijack()
-	if err2 != nil {
-		panic("Fail to hijack.")
-	}
+	defer serverConn.Close()
 
 	// pass request
-	outreq.Write(conn)
-	go copyConn("req", rconn, conn)
+	outreq.Write(serverConn)
+	go io.Copy(serverConn, clientConn)
 
 	// pass response
-	go copyConn("res", conn, rconn)
+	io.Copy(clientConn, serverConn)
 }
 
 func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -146,9 +121,9 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	outreq.ProtoMinor = 1
 	outreq.Close = false
 
-	needHijack := outreq.Header.Get("Upgrade") == "websocket"
+	upgrading := outreq.Header.Get("Upgrade") == "websocket"
 
-	if !needHijack && outreq.Header.Get("Connection") != "" {
+	if !upgrading && outreq.Header.Get("Connection") != "" {
 		// Remove the connection header to the backend.  We want a
 		// persistent connection, regardless of what the client sent
 		// to us.  This is modifying the same underlying map from req
@@ -168,11 +143,12 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		outreq.Header.Set("X-Forwarded-For", clientIP)
 	}
 
-	if needHijack {
+	if upgrading {
 		log.Println("hijacking:", outreq.URL)
 		tcpProxy(rw, outreq)
 		return
 	}
+
 	res, err := transport.RoundTrip(outreq)
 	if err != nil {
 		log.Printf("http: proxy error: %v", err)
